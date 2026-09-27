@@ -112,15 +112,15 @@ Bu _repo_ sayesinde otomatik bir şekilde, önceden zamanlayarak ve _HTTP reques
       <details>
          <summary>Yedek CRN Kullanımı</summary>
 
-      Bir dersin kontenjanının dolması durumunda otomatik olarak yedek bir CRN denenmesini istiyorsanız, `"CRN:YEDEK_CRN"` formatını kullanabilirsiniz.
+      Bir dersin kontenjanının dolması durumunda sırayla birden fazla yedek CRN denemek için `"CRN:YEDEK1:YEDEK2"` formatını kullanabilirsiniz. Tek bir yedek CRN belirtmek için `"CRN:YEDEK_CRN"` formatı da desteklenir.
 
-      Örneğin, _21345_ CRN'li dersin kontenjanı dolarsa _21346_ CRN'li dersin alınmasını istiyorsanız:
+      Örneğin, _21345_ CRN'li dersin kontenjanı dolarsa önce _21346_, onun kontenjanı da doluysa _21347_ CRN'li dersin alınmasını istiyorsanız:
 
       ```json
       {
          "courses":
          {
-            "crn": [21340, "21345:21346", 21332],
+            "crn": [21340, "21345:21346:21347", 21332],
             "scrn": []
          }
       }  
@@ -128,7 +128,7 @@ Bu _repo_ sayesinde otomatik bir şekilde, önceden zamanlayarak ve _HTTP reques
 
       Bu örnekte:
       - _21340_ ve _21332_ normal şekilde alınmaya çalışılacak
-      - _21345_ alınamazsa (kontenjan doluysa), otomatik olarak _21346_ denenecek
+      - _21345_ alınamazsa (kontenjan doluysa), önce _21346_, ardından gerekirse _21347_ denenecek
 
       </details>
 

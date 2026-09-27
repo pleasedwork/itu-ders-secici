@@ -60,12 +60,14 @@ def read_inputs(test_mode: bool=False) -> tuple[str, str, list[str], list[str], 
         crn_list = []
         for crn_entry in course_data.get("crn"):
             crn_str = str(crn_entry)
-            # Check if it has a backup (format: "primary:backup")
+            # Check if it has backups (format: "primary:backup1:backup2:...")
             if ":" in crn_str:
-                primary, backup = crn_str.split(":", 1)
+                parts = crn_str.split(":")
+                primary = parts[0]
+                backups = parts[1:]
                 crn_list.append(primary)
-                backup_map[primary] = backup
-                Logger.log(f"CRN {primary} için yedek CRN {backup} tanımlandı.")
+                backup_map[primary] = backups
+                Logger.log(f"CRN {primary} için yedek CRN'ler {backups} tanımlandı.")
             else:
                 crn_list.append(crn_str)
         Logger.log(f"CRN listesi okundu: {crn_list}.")

@@ -1,4 +1,6 @@
 # === IMPORTS ===
+import platform
+import shutil
 from importlib.metadata import PackageNotFoundError, version
 from packaging.version import Version
 from webdriver_manager.chrome import ChromeDriverManager
@@ -46,10 +48,21 @@ class DriverManager:
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
+        if platform.system() == "Linux":
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--no-sandbox")
         if headless:
             chrome_options.add_argument("--headless=new")
 
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+        chromedriver_path = shutil.which("chromium.chromedriver") or shutil.which("chromedriver")
+        if chromedriver_path:
+            Logger.log(f"Sistemde bulunan chromedriver kullanılıyor: {chromedriver_path}")
+            service = Service(executable_path=chromedriver_path)
+        else:
+            Logger.log("ChromeDriverManager ile chromedriver indiriliyor...")
+            service = Service(ChromeDriverManager().install())
+
+        driver = webdriver.Chrome(service=service, options=chrome_options)
         DriverManager.active_drivers.append(driver)
         return driver
 

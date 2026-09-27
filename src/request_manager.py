@@ -60,20 +60,31 @@ class RequestManager:
         "VAL22": "CRN {} daha önce CC ve üstü harf notu ile verildiği için yükseltmeye alınamaz."
     }
 
-    def __init__(self, token, course_selection_url: str, course_time_check_url: str, backup_map: dict[str, str] = None) -> None:
+    def __init__(self, token, course_selection_url: str, course_time_check_url: str, backup_map: dict = None) -> None:
         """
         Args:
             token: String token or callable token getter function
             course_selection_url: Course selection API URL
             course_time_check_url: Time check API URL
-            backup_map: Dictionary mapping primary CRN to backup CRN
+            backup_map: Dictionary mapping primary CRN to list of backup CRNs or single backup CRN
         """
         self._token = token
         self._token_getter = token if callable(token) else None
         self.course_selection_url = course_selection_url
         self.course_time_check_url = course_time_check_url
-        self.backup_map = backup_map or {}
-        self.original_backup_map = dict(self.backup_map)  # Keep a copy of the original backup map
+
+        # Build alternative chains and active crns state
+        self.alternative_chains = {}
+        self.active_crns_state = {}
+
+        backup_map = backup_map or {}
+        for primary, backups in backup_map.items():
+            if isinstance(backups, list):
+                chain = [primary] + backups
+            else:
+                chain = [primary, backups]
+            self.alternative_chains[primary] = chain
+            self.active_crns_state[primary] = (primary, 0)
 
     def _get_current_token(self) -> str:
         """Returns the current token."""
@@ -116,6 +127,27 @@ class RequestManager:
                 return True
             return False
 
+    def _swap_to_backup(self, crn: str, crn_list: list[str]) -> None:
+        if crn in self.active_crns_state:
+            chain_key, current_index = self.active_crns_state[crn]
+            chain = self.alternative_chains[chain_key]
+            next_index = (current_index + 1) % len(chain)
+            next_crn = chain[next_index]
+
+            if next_crn == chain_key:
+                Logger.log(f"Yedek CRN {crn} başarısız oldu, asıl CRN olan {next_crn} tekrar denenecek...")
+            else:
+                Logger.log(f"CRN {crn} yerine sıradaki yedek CRN {next_crn} denenecek...")
+
+            crn_list.remove(crn)
+            crn_list.append(next_crn)
+
+            self.active_crns_state.pop(crn, None)
+            self.active_crns_state[next_crn] = (chain_key, next_index)
+        else:
+            Logger.log(f"CRN {crn} listeden çıkarılıyor...")
+            crn_list.remove(crn)
+
     def request_course_selection(self, crn_list: list[str], scrn_list: list[str]) -> tuple[list[str], list[str], bool]:
         # Send the request to the server.
         response = requests.post(self.course_selection_url, headers=self._get_headers(), json={"ECRN": crn_list, "SCRN": scrn_list})
@@ -137,56 +169,22 @@ class RequestManager:
                 should_use_backup = result_code in RequestManager.quota_full_codes
                 is_success = result_code in RequestManager.success_codes
                 timed_out = result_code in RequestManager.timeout_codes
-                has_backup = crn in self.backup_map
-                is_backup_crn = crn in self.original_backup_map.values()
+                has_backup = crn in self.active_crns_state
             
                 if timed_out:
                     time_out_detected = True
                     return crn_list, scrn_list, time_out_detected
                 elif is_success:
                     crn_list.remove(crn)
+                    self.active_crns_state.pop(crn, None)
                 elif is_retriable:
                     if should_use_backup and has_backup:
-                        backup_crn = self.backup_map[crn]
-                        if not is_backup_crn:
-                            Logger.log(f"CRN {crn} yerine yedeği ({backup_crn}) denenecek...")
-                        else:
-                            Logger.log(f"Yedek CRN {crn} başarısız oldu, orijinal CRN ({backup_crn}) denenmeye devam edilecek...")
-
-                        crn_list.remove(crn)
-                        crn_list.append(backup_crn)
-
-                        self.backup_map.pop(crn)
-                        self.backup_map[backup_crn] = crn
+                        self._swap_to_backup(crn, crn_list)
                     else:
                         Logger.log(f"CRN {crn} tekrar denenecek...")
                 else:
-                    # Check if this CRN is currently a backup (swap happened before)
-                    if is_backup_crn:
-                        # Find the original CRN
-                        original_crn = next((k for k, v in self.original_backup_map.items() if v == crn), None)
-                        
-                        if original_crn:
-                            Logger.log(f"Yedek CRN {crn} başarısız oldu, orijinal CRN'ye ({original_crn}) dönülüyor...")
-                            
-                            crn_list.remove(crn)
-                            crn_list.append(original_crn)
-
-                            self.backup_map.pop(crn, None)
-                        else:
-                            crn_list.remove(crn)
-                            
-                    # Check if we have a backup to try
-                    elif has_backup:
-                        backup_crn = self.backup_map[crn]
-                        Logger.log(f"CRN {crn} başarısız oldu, yedeği olan ({backup_crn}) denenecek...")
-                        
-                        crn_list.remove(crn)
-                        crn_list.append(backup_crn)
-                        
-                        self.backup_map.pop(crn)
-                        
-                    # No backup available, just remove
+                    if has_backup:
+                        self._swap_to_backup(crn, crn_list)
                     else:
                         Logger.log(f"CRN {crn} listeden çıkarılıyor...")
                         crn_list.remove(crn)
