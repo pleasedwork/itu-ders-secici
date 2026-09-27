@@ -3,6 +3,8 @@ from driver_manager import DriverManager
 from selenium.webdriver.common.by import By
 from time import sleep
 from logger import Logger
+import re
+import requests
 import threading
 
 # === CONSTANTS ===
@@ -86,9 +88,165 @@ class ContinuousTokenFetcher(threading.Thread):
         self.driver.get(self.url)
         sleep(PAGE_LOAD_DELAY)
     
+    def _find_token_in_browser_state(self) -> str:
+        """Look for the bearer token in browser state without Selenium Wire."""
+        script = """
+        (() => {
+            const values = [];
+            const push = (value) => {
+                if (typeof value !== 'string') return;
+                const trimmed = value.trim();
+                if (trimmed && trimmed.length > 10 && !values.includes(trimmed)) {
+                    values.push(trimmed);
+                }
+            };
+
+            for (const storage of [window.localStorage, window.sessionStorage]) {
+                if (!storage) continue;
+                for (const key of Object.keys(storage)) {
+                    push(storage.getItem(key));
+                }
+            }
+
+            push(document.cookie || '');
+            push(document.body ? document.body.innerText : '');
+            push(document.head ? document.head.innerText : '');
+
+            try {
+                const keys = Object.keys(window).filter((key) => /token|auth|jwt|bearer/i.test(key));
+                for (const key of keys) {
+                    push(String(window[key]));
+                    if (window[key] && typeof window[key] === 'object') {
+                        push(JSON.stringify(window[key]));
+                    }
+                }
+            } catch (error) {
+                // Ignore window inspection failures.
+            }
+
+            return values;
+        })();
+        """
+
+        try:
+            storage_values = self.driver.execute_script(script) or []
+        except Exception:
+            storage_values = []
+
+        for value in storage_values:
+            if not isinstance(value, str):
+                continue
+            token = self._normalize_token(value)
+            if token:
+                return token
+
+        return ""
+
+    @staticmethod
+    def _extract_jwt_from_response(response) -> str:
+        """Read the JWT from the OBS auth endpoint or any response containing a bearer token."""
+        if response is None:
+            return ""
+
+        header_value = (
+            response.headers.get("authorization")
+            or response.headers.get("Authorization")
+            or ""
+        )
+        if header_value:
+            token = ContinuousTokenFetcher._normalize_token(header_value)
+            if token:
+                return token
+
+        payload = getattr(response, "text", "") or ""
+        if payload:
+            token = ContinuousTokenFetcher._normalize_token(payload)
+            if token:
+                return token
+
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            for key in ("jwt", "token", "access_token", "accessToken", "authorization", "Authorization"):
+                if key in data:
+                    token = ContinuousTokenFetcher._normalize_token(str(data[key]))
+                    if token:
+                        return token
+
+        return ""
+
+    @staticmethod
+    def _normalize_token(value: str) -> str:
+        """Extract a bearer token from a candidate string if one is present."""
+        if not isinstance(value, str):
+            return ""
+
+        value = value.strip()
+        if not value:
+            return ""
+
+        patterns = [
+            r'(?i)\bBearer\s+([A-Za-z0-9\-._~+/]+=*)',
+            r'(?i)(?:authorization|access[_-]?token|jwt|token)\s*[:=]\s*["\']?\s*(?:Bearer\s+)?([A-Za-z0-9\-._~+/]+=*)',
+            r'(?i)(?:authorization|access[_-]?token|jwt|token)\s*[:=]\s*["\']?\s*(?:Bearer\s+)?([A-Za-z0-9\-._~+/]+=*(?:\.[A-Za-z0-9\-._~+/]+=*)+)',
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, value)
+            for match in matches:
+                token = match[0] if isinstance(match, tuple) else match
+                token = token.strip().strip('"\'')
+                if token and len(token) > 20:
+                    if token.lower().startswith("bearer "):
+                        return token
+                    return f"Bearer {token}" if "Bearer " not in token else token
+
+        for candidate in [
+            value,
+            *value.split(";"),
+            *value.split(","),
+            *value.split("\\n"),
+            *value.split("\\r"),
+        ]:
+            candidate = candidate.strip().strip('"\'')
+            if not candidate:
+                continue
+            if candidate.lower().startswith("bearer ") and len(candidate) > 20:
+                return candidate
+
+            if candidate.lower().startswith("eyj") and len(candidate) > 20:
+                return f"Bearer {candidate}"
+
+            if re.search(r'(?i)\beyj[A-Za-z0-9\-._~+/]+=*\.[A-Za-z0-9\-._~+/]+=*\.[A-Za-z0-9\-._~+/]+=*', candidate):
+                token = re.search(r'(?i)(eyj[A-Za-z0-9\-._~+/]+=*\.[A-Za-z0-9\-._~+/]+=*\.[A-Za-z0-9\-._~+/]+=*)', candidate)
+                if token:
+                    return f"Bearer {token.group(1)}"
+
+        return ""
+
+    def _fetch_obs_jwt(self) -> str:
+        """Fetch the JWT directly from the OBS auth endpoint used by the frontend."""
+        try:
+            session = requests.Session()
+            for cookie in self.driver.get_cookies():
+                session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie.get("domain") or ".itu.edu.tr",
+                    path=cookie.get("path") or "/",
+                )
+
+            response = session.get("https://obs.itu.edu.tr/ogrenci/auth/jwt", timeout=20)
+            return self._extract_jwt_from_response(response)
+        except Exception as exc:
+            Logger.log(f"OBS JWT endpointinden token alınamadı: {exc}", silent=True)
+            return ""
+
     def _fetch_token_once(self) -> str:
-        """Single token fetch operation. Re-login if logged out after refresh."""
-        # if the url is not the target url, open the target url
+        """Single token fetch operation without a proxy layer."""
         if self.url not in self.driver.current_url:
             Logger.log("Ders seçim sitesi açılıyor...", silent=self._started_event.is_set())
             self.driver.get(self.url)
@@ -97,19 +255,37 @@ class ContinuousTokenFetcher(threading.Thread):
         self.driver.refresh()
         sleep(1)
 
-        # Check if we got logged out after refresh (login page detected)
         if "girisv3.itu.edu.tr" in self.driver.current_url:
             Logger.log("Kepler hesabından çıkıldığı algılandı, tekrar giriş yapılıyor...")
             self.login_to_kepler()
-            # After re-login, refresh again to ensure requests are captured
             self.driver.refresh()
             sleep(1)
 
-        for request in self.driver.requests:
-            # if There is a response and the request is from the token url
-            if request.response and TOKEN_URL in request.url:
-                token = request.headers["authorization"]
+        token = self._fetch_obs_jwt()
+        if token:
+            return token
+
+        token = self._find_token_in_browser_state()
+        if token:
+            return token
+
+        try:
+            session = requests.Session()
+            for cookie in self.driver.get_cookies():
+                session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie.get("domain") or ".itu.edu.tr",
+                    path=cookie.get("path") or "/",
+                )
+
+            response = session.get(TOKEN_URL, timeout=20)
+            token = self._extract_jwt_from_response(response)
+            if token:
                 return token
+        except Exception as exc:
+            Logger.log(f"Token çıkarma sırasında tarayıcı oturumu çözümlenemedi: {exc}", silent=True)
+
         return ""
     
     def run(self) -> None:
